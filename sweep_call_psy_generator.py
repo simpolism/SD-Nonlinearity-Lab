@@ -22,7 +22,7 @@ Example:
     --calibrate \
     --patch-mlp
 """
-import argparse, csv, itertools, os, math, subprocess, sys, shlex
+import argparse, csv, itertools, os, math, subprocess, sys, shlex, traceback
 from typing import List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -143,6 +143,8 @@ def main():
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--outdir", type=str, default="sweep_out")
     ap.add_argument("--cols", type=int, default=3)
+    ap.add_argument("--subprocess", action="store_true",
+                    help="Force subprocess execution per run (disables pipeline reuse).")
     args = ap.parse_args()
 
     ensure_dir(args.outdir)
@@ -160,6 +162,24 @@ def main():
     rows.append(header)
 
     combolist = list(itertools.product(acts, taus, betas))
+
+    reuse = not args.subprocess
+    pipe = None
+    run_kwargs = None
+    if reuse:
+        import sd_unet_psy_acts as psy
+        pipe = psy.load_pipeline()
+        run_kwargs = {
+            "prompt": args.prompt,
+            "steps": args.steps,
+            "cfg": args.cfg,
+            "seed": args.seed,
+            "gamma": args.gamma,
+            "stages": ",".join(stages),
+            "start_idx": args.start_idx,
+            "patch_mlp": args.patch_mlp,
+            "calibrate": args.calibrate,
+        }
 
     # Generate once per combo by calling the original generator
     for idx, (act, tau, beta) in enumerate(combolist, start=1):
@@ -182,7 +202,25 @@ def main():
         if args.patch_mlp: gen_args.append("--patch-mlp")
         if args.calibrate: gen_args.append("--calibrate")
 
-        rc = run_generator(args.gen_path, gen_args)
+        if reuse:
+            try:
+                # per-combo overrides
+                per_run = dict(run_kwargs)
+                per_run.update({
+                    "out": out_base,
+                    "act": act,
+                    "tau": tau,
+                    "beta": beta,
+                })
+                psy.run_from_kwargs(pipe=pipe, **per_run)
+                rc = 0
+            except Exception as exc:
+                print(f"[WARN] Generator exception for {tag}: {exc}")
+                traceback.print_exc()
+                rc = 1
+        else:
+            rc = run_generator(args.gen_path, gen_args)
+
         if rc != 0:
             print(f"[WARN] Generator returned {rc} for {tag}; skipping metrics.")
             continue

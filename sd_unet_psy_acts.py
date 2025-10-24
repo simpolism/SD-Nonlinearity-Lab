@@ -30,6 +30,27 @@ from PIL import ImageChops
 torch.backends.cuda.matmul.allow_tf32 = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ---------------------- Pipeline Helper ----------------------
+
+def load_pipeline(
+    model_id: str = "runwayml/stable-diffusion-v1-5",
+    dtype: torch.dtype = torch.float16,
+    device_override: str = device,
+) -> StableDiffusionPipeline:
+    """
+    Load the Stable Diffusion pipeline onto the requested device. Intended for reuse
+    across multiple generation calls (e.g., parameter sweeps).
+    """
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype
+    ).to(device_override)
+    try:
+        pipe.enable_attention_slicing()
+    except Exception:
+        pass
+    return pipe
+
 # ---------------------- Activation Library ----------------------
 
 def make_base_act(kind: str) -> nn.Module:
@@ -176,11 +197,12 @@ def build_psy_factory(act_kind: str, tau: float, beta: float, gamma: float) -> C
         return PsyAct(baseline, new_act, tau=tau, beta=beta, gamma=gamma)
     return factory
 
-def patch_unet(unet: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct]]:
+def patch_unet(unet: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct], List[Tuple[nn.Module, str, nn.Module]]]:
     from diffusers.models.resnet import ResnetBlock2D
     count = 0
     patched: Dict[str, PsyAct] = {}
     idx_by_stage = {"down": -1, "mid": -1, "up": -1}
+    replacements: List[Tuple[nn.Module, str, nn.Module]] = []
 
     # Replace SiLU inside ResnetBlock2D (core UNet nonlinearity)
     for fullname, m in unet.named_modules():
@@ -193,6 +215,7 @@ def patch_unet(unet: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct]]:
                         psy = build_psy_factory(cfg.act_kind, cfg.tau, cfg.beta, cfg.gamma)()
                         m._modules[attr] = psy
                         patched[f"{fullname}.{attr}"] = psy
+                        replacements.append((m, attr, child))
                         count += 1
 
     # Optionally patch attention MLP activations (often GELU/SiLU)
@@ -204,9 +227,15 @@ def patch_unet(unet: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct]]:
                     psy = build_psy_factory(cfg.act_kind, cfg.tau, cfg.beta, cfg.gamma)()
                     parent._modules[attr] = psy
                     patched[fullname] = psy
+                    replacements.append((parent, attr, child))
                     count += 1
 
-    return count, patched
+    return count, patched, replacements
+
+def restore_unet(replacements: List[Tuple[nn.Module, str, nn.Module]]):
+    """Restore modules swapped by patch_unet back to their original instances."""
+    for parent, attr, original in replacements:
+        parent._modules[attr] = original
 
 # ---------------------- Variance Matching ----------------------
 
@@ -258,15 +287,11 @@ def remove_taps(unet: nn.Module):
 
 # ---------------------- Main Run ----------------------
 
-def run(args):
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        torch_dtype=torch.float16
-    ).to(device)
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
+def run(args, pipe: StableDiffusionPipeline = None):
+    own_pipe = False
+    if pipe is None:
+        pipe = load_pipeline()
+        own_pipe = True
 
     # ---- Baseline (and optional stat collection) ----
     g = torch.Generator(device=device).manual_seed(args.seed)
@@ -296,33 +321,46 @@ def run(args):
         patch_attn_mlp=args.patch_mlp,
         calibrate=args.calibrate
     )
-    n, per_act = patch_unet(pipe.unet, cfg)
-    print(f"[UNet] Patched {n} activation modules | act={args.act} tau={args.tau} beta={args.beta} gamma={args.gamma} | stages={cfg.stages} start_idx={cfg.start_idx} MLP={cfg.patch_attn_mlp}")
+    replacements: List[Tuple[nn.Module, str, nn.Module]] = []
+    n = 0
+    per_act: Dict[str, PsyAct] = {}
+    try:
+        n, per_act, replacements = patch_unet(pipe.unet, cfg)
+        print(f"[UNet] Patched {n} activation modules | act={args.act} tau={args.tau} beta={args.beta} gamma={args.gamma} | stages={cfg.stages} start_idx={cfg.start_idx} MLP={cfg.patch_attn_mlp}")
 
-    # ---- Variance-match (module path only) ----
-    if args.calibrate and per_act:
-        print("[Calib] Performing variance matching on patched modules...")
-        variance_match(per_act, baseline_store)
+        # ---- Variance-match (module path only) ----
+        if args.calibrate and per_act:
+            print("[Calib] Performing variance matching on patched modules...")
+            variance_match(per_act, baseline_store)
 
-    # ---- Patched image with the SAME seed ----
-    g = torch.Generator(device=device).manual_seed(args.seed)
-    if n == 0:
-        print("[Fallback] No nn.SiLU/nn.GELU modules found; patching F.silu/F.gelu functionally.")
-        with patch_functional_acts(args.act, args.tau, args.beta, args.gamma):
+        # ---- Patched image with the SAME seed ----
+        g = torch.Generator(device=device).manual_seed(args.seed)
+        if n == 0:
+            print("[Fallback] No nn.SiLU/nn.GELU modules found; patching F.silu/F.gelu functionally.")
+            with patch_functional_acts(args.act, args.tau, args.beta, args.gamma):
+                imgB = pipe(
+                    args.prompt,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.cfg,
+                    generator=g
+                ).images[0]
+        else:
             imgB = pipe(
                 args.prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.cfg,
                 generator=g
             ).images[0]
-    else:
-        imgB = pipe(
-            args.prompt,
-            num_inference_steps=args.steps,
-            guidance_scale=args.cfg,
-            generator=g
-        ).images[0]
+    finally:
+        if replacements:
+            restore_unet(replacements)
+        if own_pipe:
+            try:
+                pipe.to("cpu")
+            except Exception:
+                pass
 
+    outA = args.out.replace(".png", "_A_baseline.png")
     outB = args.out.replace(".png", "_B_patched.png")
     imgB.save(outB)
 
@@ -331,7 +369,39 @@ def run(args):
         print("[WARN] Patched image is pixel-identical to baseline. "
               "If you expected differences, increase --tau / --beta or verify patching was applied.")
 
-    print("Done. Wrote:", args.out.replace(".png", "_A_baseline.png"), "and", outB)
+    print("Done. Wrote:", outA, "and", outB)
+    return {
+        "baseline_path": outA,
+        "patched_path": outB,
+        "patched_modules": n,
+        "used_fallback": (n == 0)
+    }
+
+def run_from_kwargs(pipe: StableDiffusionPipeline = None, **kwargs):
+    """
+    Convenience helper so other scripts (e.g., sweeps) can call into this module without
+    spawning a new Python process or reparsing CLI arguments.
+    """
+    defaults = {
+        "prompt": "a cozy reading nook with warm ambient light, 35mm film grain",
+        "out": "psy_test.png",
+        "steps": 30,
+        "cfg": 7.5,
+        "seed": 12345,
+        "act": "silu",
+        "tau": 1.0,
+        "beta": 0.0,
+        "gamma": 1.0,
+        "stages": "up,mid",
+        "start_idx": 0,
+        "patch_mlp": False,
+        "calibrate": False,
+    }
+    merged = {**defaults, **kwargs}
+    if "prompt" not in merged or "out" not in merged:
+        raise ValueError("run_from_kwargs requires at least 'prompt' and 'out'.")
+    args = argparse.Namespace(**merged)
+    return run(args, pipe=pipe)
 
 def main():
     p = argparse.ArgumentParser()
