@@ -2,6 +2,8 @@
 
 SD Psychedelic Lab is an inference-time playground for Stable Diffusion activation experiments.  It lets you flatten or remix UNet nonlinearities, gate those interventions by stage and denoising step, and compare patched vs. baseline renders side by side.  Nothing is fine-tuned—everything happens on-the-fly with deterministic seeds.
 
+Biologically, classic psychedelics (e.g., LSD, psilocybin) are associated with relaxed gating and increased entropy in cortical circuits—there is evidence that dendritic nonlinearities flatten and functional connectivity becomes more fluid.  That softened “transfer curve” allows atypical signals to propagate, producing novel associations and vivid perceptual blends.  Stable Diffusion employs SiLU activations throughout its UNet; by nudging those nonlinearities toward flatter or identity-like responses we can mimic a similar loosening.  SD Psychedelic Lab provides safe, reversible knobs for probing how activation geometry shapes coherence, texture, and semantics inside a generative model.
+
 ---
 
 ## Features
@@ -69,6 +71,29 @@ The dashboard mirrors CLI controls, adds persistence in local storage, and shows
 | `saved_web_out/` | Optional archive of previous runs. |
 | `AGENTS.md` | Agent/automation guide. |
 | `requirements.txt` | Python dependencies. |
+| `sweep_call_psy_generator.py` | Legacy sweep driver for scripted parameter grids. |
+
+---
+
+## Parameter Sweeps
+
+For bulk experiments there is a legacy sweep helper:
+
+```bash
+python sweep_call_psy_generator.py \
+  --prompt "dreamlike reading nook" \
+  --acts silu,mish,gelu_tanh \
+  --taus 1.0,1.2,1.4 \
+  --betas 0.0,0.15,0.3 \
+  --stages up,mid \
+  --start-idx 0 \
+  --outdir sweep_out \
+  --calibrate
+```
+
+- It shells out to `sd_unet_psy_acts.py` for each configuration, emplacing results and metrics in `sweep_out/`.
+- The script predates per-stage start/end overrides and denoising step windows—those knobs default to the global `--start-idx` and always use the full step range.
+- Extend it (e.g., add `--start-idx-up` / `--step-start`) if your sweep needs the newer controls.
 
 ---
 
@@ -88,4 +113,3 @@ The dashboard mirrors CLI controls, adds persistence in local storage, and shows
 - Extended analytics (LPIPS/CLIP score) for batch comparisons.
 
 Pull requests and experiments welcome—open an issue to discuss new activation schedules or visualization ideas.  Have fun bending diffusion activations into psychedelic territory! 🌈
-

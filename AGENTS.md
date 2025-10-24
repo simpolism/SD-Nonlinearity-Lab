@@ -85,6 +85,7 @@ python psy_web_ui.py
 | `psy_web_ui.py` | Flask UI server. |
 | `web_out/` | Generated images and cached baselines. |
 | `saved_web_out/` | Optional archive of previous runs. |
+| `sweep_call_psy_generator.py` | Legacy sweep driver for scripted parameter grids. |
 | `requirements.txt` | Python dependencies; install via `pip install -r requirements.txt`. |
 
 Environment tips:
@@ -99,6 +100,7 @@ Environment tips:
 - Activation library: extend `make_base_act` for new nonlinearities.
 - Step windowing: adjust `step_start` / `step_end` or modify the callback in `sd_unet_psy_acts.py` for custom schedules.
 - Future img2img support (planned): pipeline swap will be keyed on optional init images; agents should pass file paths once implemented.
+- Sweeps: `sweep_call_psy_generator.py` orchestrates older grid runs (global `--start-idx`, full step span). Extend it if you need per-stage ranges or step windows.
 
 ---
 
