@@ -139,7 +139,6 @@ def _build_baseline_key(opts: dict) -> Tuple:
         opts["steps"],
         opts["cfg"],
         opts["seed"],
-        tuple(sorted(opts["stages"])),
         opts["act"],
         float(opts["tau"]),
         float(opts["beta"]),

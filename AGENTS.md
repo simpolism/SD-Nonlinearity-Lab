@@ -1,65 +1,105 @@
-# AGENTS.md
+# SD Psychedelic Lab – Agent Guide
 
-## Overview
+This document is aimed at any automated assistant or scripted workflow that operates inside this repository.  Use it to understand the preferred entry points, constraints, and coordination rules.
 
-This project explores **test-time manipulation of UNet nonlinearities** in a Stable-Diffusion-style model to simulate “psychedelic-like” network dynamics: we reduce the **curvature** of activation functions and/or blend in **identity passthrough**, optionally swapping the **activation type** itself. The core intuition is that flattening/gating less tightly allows atypical signals to propagate, increasing the entropy of internal states and producing images with altered coherence, texture, and semantics — an AI analogue to how psychedelics may modulate neuronal input-output curves.
+---
 
-## What the code does
+## 1. Mission Snapshot
 
-- Loads `runwayml/stable-diffusion-v1-5` (fp16) and renders **A/B images** with the **same seed**:
-  - **A**: baseline (unaltered activations).
-  - **B**: patched UNet with your chosen activation **shape** and two “psychedelic” knobs.
+SD Psychedelic Lab is an experimentation harness for altering Stable Diffusion UNet activations at inference time.  Two surfaces matter:
 
-- Three independent knobs:
-  1) **Activation type** `--act`  
-     Choose the target nonlinearity: `silu, gelu, gelu_tanh, relu, leakyrelu, mish, hswish, softsign, softplus`.
+1. `sd_unet_psy_acts.py` – CLI/SDK for patching activations, caching baselines, and variance-matching.
+2. `psy_web_ui.py` – Flask web application that wraps the CLI in a controls dashboard (per-stage start/end, step windows, baseline previews).
 
-  2) **Curvature reduction** `--tau`  
-     Applies the activation to a scaled preactivation `x/τ`. **τ>1** flattens curvature (weaker gating/saturation).
+Agents typically:
 
-  3) **Identity blending** `--beta`  
-     Blends the activation with identity: `y = (1-β)·act(x/τ) + β·x`. Higher **β** → more linear passthrough, looser constraints.
+- Generate or compare A/B renders for a fixed seed.
+- Sweep activation parameters (`act`, `tau`, `beta`, `gamma`).
+- Toggle stage coverage (`down`, `mid`, `up`) and depth windows.
+- Gate patched activations to a denoising step window.
+- Launch or interact with the web UI locally (default port `7860`).
 
-  Additionally, `--gamma` blends **SiLU** with your chosen activation **before** identity mixing:  
-  `mix = (1-γ)·SiLU(x/τ) + γ·act_new(x/τ)`.
+---
 
-- **Targeting**: limit changes to `--stages` (`down, mid, up`) and `--start-idx` within those stages. `--patch-mlp` includes attention MLPs.
+## 2. Safety & Resource Rules
 
-- **Variance matching** `--calibrate`: on a baseline pass, it records per-site mean/variance and then applies an affine correction to the patched activations so downstream layers see the same first/second moments. This isolates **shape** effects from **scale** artifacts.
+| Topic | Expectations |
+|-------|--------------|
+| GPU usage | Pipelines load in FP16 by default. Idle pipelines are offloaded back to CPU to limit VRAM. |
+| Baselines | Baseline renders are reused whenever prompt/steps/cfg/seed/model are unchanged. Stage/step tweaks do **not** force a recompute. |
+| Caching | Baseline cache lives under `web_out/baseline_cache/`. Only remove entries intentionally – new baselines auto-replace older ones when the key collides. |
+| External writes | Avoid writing outside the repo except for HuggingFace model downloads (handled by diffusers). |
+| Secrets | No API keys are stored here. If an agent requires authentication (e.g., HF token) it must obtain it from environment variables supplied at runtime. |
 
-- **Functional fallback**: some SD UNets call `F.silu`/`F.gelu` directly (no `nn.SiLU/nn.GELU` submodules). If no modules were replaced, the script automatically **monkey-patches** those functional calls during the patched pass only. This guarantees your knobs take effect across model variants.
+---
 
-## Why this design
+## 3. Launch Recipes
 
-- **Safe, reversible interventions**: no fine-tuning; A/B is strictly inference-time.
-- **Comparability**: fixed seed and optional variance matching isolate the perceptual effects of changing **activation geometry**.
-- **Scoping**: per-stage and per-depth selection lets you study how early (texture) versus late (semantics/layout) processing shifts under flatter/identity-blended activations.
-
-## Quick start
+### 3.1 CLI Rendering
 
 ```bash
 python sd_unet_psy_acts.py \
-  --prompt "a cozy reading nook with warm ambient light, 35mm film grain" \
-  --out demo.png \
-  --act mish --tau 1.3 --beta 0.2 --gamma 1.0 \
-  --stages up,mid --steps 30 --cfg 7.5 --seed 12345 --calibrate
-# -> demo_A_baseline.png and demo_B_patched.png
+  --prompt "dreamlike cityscape" \
+  --out city.png \
+  --act mish --tau 1.4 --beta 0.25 --gamma 0.8 \
+  --stages up,mid \
+  --start-idx-up 2 --end-idx-up 9 \
+  --step-start 10 --step-end 25 \
+  --steps 30 --cfg 7.5 --seed 1337 \
+  --calibrate
 ```
 
-## Interpreting effects (rules of thumb)
+Notes for agents:
+- `--step-start/-end` gate when patched activations are enabled.
+- Per-stage overrides fall back to `--start-idx` / `--end-idx` when omitted.
+- If calibration is requested and a cached baseline exists, it will be reused; otherwise one is generated automatically.
 
-* Increase **τ** (curvature flattening): freer flow of weak/atypical features → more surreal/global drift.
-* Increase **β** (identity blend): stronger linear passthrough → higher entropy, looser constraints, potential loss of crispness.
-* Change **act**: different tail/saturation behavior (e.g., `mish` richer tails; `gelu_tanh` smoother) reshapes style.
+### 3.2 Web UI
 
-## Extending
+```bash
+python psy_web_ui.py
+# opens http://127.0.0.1:7860
+```
 
-* **Step schedules**: make τ/β a function of the denoising timestep (e.g., stronger early → “coming-up,” taper late).
-* **Metrics**: pair with a sweep driver that computes LPIPS, CLIPScore, entropy, sharpness, and produces contact sheets.
-* **Other backbones**: the same pattern applies to SD v2/XL UNets; just keep the functional fallback in place.
+- The UI displays real-time activation curves and stage coverage.
+- Step and stage ranges accept “∞” by leaving the field blank.
+- Baseline previews appear beneath the patched render when available and indicate whether the baseline was reused from cache.
 
-## Troubleshooting
+---
 
-* **Images look identical**: likely no modules were replaced; the script now auto-patches `F.silu/F.gelu`. If still identical, increase `--tau`/`--beta`, try `--act mish`, or target `--stages down`.
-* **Washed-out results**: reduce `--beta`, enable `--calibrate`, or try a gentler τ (e.g., 1.1–1.2).
-* **OOM on 12–16 GB**: keep batch=1, use `--steps 20–30`, and rely on attention slicing (enabled by default when available).
+## 4. Coordination Guidelines
+
+1. **Preserve determinism.** Always specify `--seed` (CLI) or set the seed field (UI) when comparing runs.  
+2. **Respect cache semantics.** Only delete `web_out/baseline_cache/` or `web_out/` outputs if new baselines are explicitly required.  
+3. **Record settings.** When sharing outputs, include activation knob values, stage/step ranges, and whether variance matching was enabled.  
+4. **Testing.** Use `python -m py_compile psy_web_ui.py sd_unet_psy_acts.py` before submitting changes.  
+5. **Notebooks/Sweeps.** `sweep_call_psy_generator.py` demonstrates programmatic sweeps—copy it when automating large parameter grids.  
+
+---
+
+## 5. Useful Paths & Environment
+
+| Path | Purpose |
+|------|---------|
+| `sd_unet_psy_acts.py` | Core activation patching CLI. |
+| `psy_web_ui.py` | Flask UI server. |
+| `web_out/` | Generated images and cached baselines. |
+| `saved_web_out/` | Optional archive of previous runs. |
+| `requirements.txt` | Python dependencies; install via `pip install -r requirements.txt`. |
+
+Environment tips:
+- Requires Python ≥ 3.10 with CUDA-capable PyTorch for GPU acceleration.
+- HuggingFace models download automatically the first time they are used.
+- `torch.cuda.empty_cache()` is invoked when swapping pipelines; no manual action needed unless GPU pressure persists.
+
+---
+
+## 6. Extensibility Hooks
+
+- Activation library: extend `make_base_act` for new nonlinearities.
+- Step windowing: adjust `step_start` / `step_end` or modify the callback in `sd_unet_psy_acts.py` for custom schedules.
+- Future img2img support (planned): pipeline swap will be keyed on optional init images; agents should pass file paths once implemented.
+
+---
+
+Stay within these guidelines and SD Psychedelic Lab should remain stable, reproducible, and ready for psychedelic activation explorations. Happy hallucinating! 👾🌈
