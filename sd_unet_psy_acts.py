@@ -82,16 +82,32 @@ class FuncPsyAct:
     No affine correction here (variance-match only supported for module path).
     """
     def __init__(self, baseline_fn: Callable, new_act_module: nn.Module,
-                 tau=1.0, beta=0.0, gamma=1.0):
+                 tau=1.0, beta=0.0, gamma=1.0,
+                 orig_silu: Callable = None, orig_gelu: Callable = None):
         self.baseline_fn = baseline_fn
         self.new_act  = new_act_module
         self.tau, self.beta, self.gamma = float(tau), float(beta), float(gamma)
+        self.orig_silu = orig_silu
+        self.orig_gelu = orig_gelu
 
     def __call__(self, x, *args, **kwargs):
         z = x / self.tau
         base = self.baseline_fn(z, *args, **kwargs)
-        mix = (1.0 - self.gamma) * base + self.gamma * self.new_act(z)
+        mix = (1.0 - self.gamma) * base + self.gamma * self._call_new(z)
         return (1.0 - self.beta) * mix + self.beta * x
+
+    def _call_new(self, z):
+        if self.orig_silu is None and self.orig_gelu is None:
+            return self.new_act(z)
+        cur_silu, cur_gelu = F.silu, F.gelu
+        try:
+            if self.orig_silu is not None:
+                F.silu = self.orig_silu
+            if self.orig_gelu is not None:
+                F.gelu = self.orig_gelu
+            return self.new_act(z)
+        finally:
+            F.silu, F.gelu = cur_silu, cur_gelu
 
 class patch_functional_acts:
     """
@@ -106,8 +122,16 @@ class patch_functional_acts:
         self._old_silu, self._old_gelu = F.silu, F.gelu
         new_act_silu = make_base_act(self.act_kind)
         new_act_gelu = make_base_act(self.act_kind)
-        silu_fn = FuncPsyAct(self._old_silu, new_act_silu, tau=self.tau, beta=self.beta, gamma=self.gamma)
-        gelu_fn = FuncPsyAct(self._old_gelu, new_act_gelu, tau=self.tau, beta=self.beta, gamma=self.gamma)
+        silu_fn = FuncPsyAct(
+            self._old_silu, new_act_silu,
+            tau=self.tau, beta=self.beta, gamma=self.gamma,
+            orig_silu=self._old_silu, orig_gelu=self._old_gelu
+        )
+        gelu_fn = FuncPsyAct(
+            self._old_gelu, new_act_gelu,
+            tau=self.tau, beta=self.beta, gamma=self.gamma,
+            orig_silu=self._old_silu, orig_gelu=self._old_gelu
+        )
         F.silu = lambda x, *a, **k: silu_fn(x, *a, **k)
         F.gelu = lambda x, *a, **k: gelu_fn(x, *a, **k)  # keep attention MLPs coherent
         return self
