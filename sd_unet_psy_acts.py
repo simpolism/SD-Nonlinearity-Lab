@@ -4,12 +4,15 @@
 Drop-in UNet activation patcher for Stable Diffusion v1.5
 
 Knobs:
-  - --act {silu,gelu,gelu_tanh,relu,leakyrelu,mish,hswish,softsign,softplus}
+  - --act {silu,gelu,gelu_tanh,relu,leakyrelu,mish,hswish,softsign,softplus,hardtanh}
   - --tau <float>        (pre-activation temperature; >1.0 flattens curvature)
   - --beta <float>       (identity blend; 0 = pure act, 1 = pure identity)
   - --gamma <float>      (blend new act with baseline SiLU before identity)
   - --stages down,mid,up (comma list)
   - --start-idx <int>    (first resblock index within targeted stages)
+  - --start-idx-<stage>  (override start for individual stages)
+  - --end-idx <int>      (last resblock index inclusive; omit for full stage)
+  - --end-idx-<stage>    (override end for individual stages)
   - --patch-mlp          (also patch attention MLP GELU/SiLU)
   - --calibrate          (variance-match per patched module using a baseline pass)
 
@@ -185,6 +188,7 @@ def make_base_act(kind: str) -> nn.Module:
         return HSwish()
     if kind == "softsign":    return nn.Softsign()
     if kind == "softplus":    return nn.Softplus(beta=1.0, threshold=20.0)
+    if kind == "hardtanh":    return nn.Hardtanh(min_val=-1.0, max_val=1.0)
     raise ValueError(f"Unknown act kind: {kind}")
 
 class PsyAct(nn.Module):
@@ -205,8 +209,18 @@ class PsyAct(nn.Module):
         self.gamma    = float(gamma)
         self.register_buffer("gain_buf", torch.tensor(float(gain)), persistent=False)
         self.register_buffer("bias_buf", torch.tensor(float(bias)), persistent=False)
+        self._active = True
+
+    def set_active(self, active: bool) -> None:
+        self._active = bool(active)
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
 
     def forward(self, x):
+        if not self._active:
+            return self.baseline(x)
         z = x / self.tau
         mix = (1.0 - self.gamma) * self.baseline(z) + self.gamma * self.new_act(z)
         y = (1.0 - self.beta) * mix + self.beta * x
@@ -284,6 +298,9 @@ class patch_functional_acts:
 class PatchCfg:
     stages: List[str]
     start_idx: int
+    start_idx_per_stage: Dict[str, int]
+    end_idx: Optional[int]
+    end_idx_per_stage: Dict[str, Optional[int]]
     act_kind: str
     tau: float
     beta: float
@@ -315,13 +332,15 @@ def build_psy_factory(act_kind: str, tau: float, beta: float, gamma: float) -> C
         return PsyAct(baseline, new_act, tau=tau, beta=beta, gamma=gamma)
     return factory
 
-def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct], List[Tuple[nn.Module, str, nn.Module]]]:
+def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, PsyAct], List[Tuple[nn.Module, str, nn.Module]], Dict[str, int]]:
     from diffusers.models.resnet import ResnetBlock2D
     count = 0
     patched: Dict[str, PsyAct] = {}
     idx_by_stage = {"down": -1, "mid": -1, "up": -1}
+    resnet_index_map: Dict[str, Dict[str, int]] = {"down": {}, "mid": {}, "up": {}}
     replacements: List[Tuple[nn.Module, str, nn.Module]] = []
     patched_fullnames = set()
+    stage_depths: Dict[str, int] = {"down": 0, "mid": 0, "up": 0}
 
     def stage_allowed(stage: Optional[str]) -> bool:
         if "all" in cfg.stages:
@@ -331,11 +350,18 @@ def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, P
     # Replace SiLU inside ResnetBlock2D (core UNet nonlinearity)
     for fullname, m in denoiser.named_modules():
         st = stage_of_name(fullname)
+        if isinstance(m, ResnetBlock2D) and st in stage_depths:
+            stage_depths[st] += 1
         if isinstance(m, ResnetBlock2D) and stage_allowed(st):
             stage = st or "all"
             if stage in idx_by_stage:
                 idx_by_stage[stage] += 1
-                if stage in cfg.stages and idx_by_stage[stage] < cfg.start_idx:
+                resnet_index_map[stage][fullname] = idx_by_stage[stage]
+                start_threshold = cfg.start_idx_per_stage.get(stage, cfg.start_idx)
+                end_threshold = cfg.end_idx_per_stage.get(stage, cfg.end_idx)
+                if stage in cfg.stages and idx_by_stage[stage] < start_threshold:
+                    continue
+                if stage in cfg.stages and end_threshold is not None and idx_by_stage[stage] > end_threshold:
                     continue
             for attr, child in list(m._modules.items()):
                 if isinstance(child, nn.SiLU):
@@ -347,6 +373,18 @@ def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, P
                     patched_fullnames.add(fullname_attr)
                     count += 1
 
+    def resolve_resnet_index(stage: Optional[str], path: str) -> Optional[int]:
+        if stage not in resnet_index_map:
+            return None
+        current = path
+        while current:
+            if current in resnet_index_map[stage]:
+                return resnet_index_map[stage][current]
+            if "." not in current:
+                break
+            current = current.rsplit(".", 1)[0]
+        return None
+
     # General fallback: patch remaining leaf SiLU/GELU modules within allowed scopes
     for parent, attr, child, fullname in _iter_leaf_acts(denoiser):
         st = stage_of_name(fullname)
@@ -356,6 +394,17 @@ def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, P
         if fullname_attr in patched_fullnames:
             continue
         if isinstance(child, (nn.GELU, nn.SiLU)):
+            start_threshold = cfg.start_idx_per_stage.get(st, cfg.start_idx)
+            end_threshold = cfg.end_idx_per_stage.get(st, cfg.end_idx)
+            if st in cfg.stages:
+                res_idx = resolve_resnet_index(st, fullname)
+                if res_idx is not None:
+                    if res_idx < start_threshold:
+                        continue
+                    if end_threshold is not None and res_idx > end_threshold:
+                        continue
+                elif start_threshold > 0:
+                    continue
             psy = build_psy_factory(cfg.act_kind, cfg.tau, cfg.beta, cfg.gamma)()
             parent._modules[attr] = psy
             patched[fullname_attr] = psy
@@ -372,6 +421,17 @@ def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, P
             if not stage_allowed(st):
                 continue
             if isinstance(child, (nn.GELU, nn.SiLU)):
+                start_threshold = cfg.start_idx_per_stage.get(st, cfg.start_idx)
+                end_threshold = cfg.end_idx_per_stage.get(st, cfg.end_idx)
+                if st in cfg.stages:
+                    res_idx = resolve_resnet_index(st, fullname)
+                    if res_idx is not None:
+                        if res_idx < start_threshold:
+                            continue
+                        if end_threshold is not None and res_idx > end_threshold:
+                            continue
+                    elif start_threshold > 0:
+                        continue
                 psy = build_psy_factory(cfg.act_kind, cfg.tau, cfg.beta, cfg.gamma)()
                 parent._modules[attr] = psy
                 patched[fullname] = psy
@@ -379,7 +439,7 @@ def patch_denoiser(denoiser: nn.Module, cfg: PatchCfg) -> Tuple[int, Dict[str, P
                 patched_fullnames.add(fullname)
                 count += 1
 
-    return count, patched, replacements
+    return count, patched, replacements, stage_depths
 
 def restore_denoiser(replacements: List[Tuple[nn.Module, str, nn.Module]]):
     """Restore modules swapped by patch_denoiser back to their original instances."""
@@ -546,9 +606,43 @@ def run(
     # baseline already computed/retrieved above
 
     # ---- Patch modules ----
+    start_idx_map = {
+        "down": getattr(args, "start_idx_down", None),
+        "mid": getattr(args, "start_idx_mid", None),
+        "up": getattr(args, "start_idx_up", None),
+    }
+    end_idx_map = {
+        "down": getattr(args, "end_idx_down", None),
+        "mid": getattr(args, "end_idx_mid", None),
+        "up": getattr(args, "end_idx_up", None),
+    }
+    for key, val in list(start_idx_map.items()):
+        if val is None:
+            start_idx_map[key] = args.start_idx
+        else:
+            start_idx_map[key] = max(0, int(val))
+    for key, val in list(end_idx_map.items()):
+        if val is None:
+            end_idx_map[key] = args.end_idx
+        else:
+            end_idx_map[key] = max(0, int(val))
+        if end_idx_map[key] is not None and end_idx_map[key] < start_idx_map[key]:
+            end_idx_map[key] = start_idx_map[key]
+    args.start_idx = max(0, int(args.start_idx))
+    if args.end_idx is not None:
+        args.end_idx = max(args.start_idx, max(0, int(args.end_idx)))
+    args.step_start = max(0, int(getattr(args, "step_start", 0) or 0))
+    if getattr(args, "step_end", None) is not None:
+        args.step_end = max(args.step_start, max(0, int(args.step_end)))
+    else:
+        args.step_end = None
+
     cfg = PatchCfg(
         stages=[s.strip() for s in args.stages.split(",") if s.strip()],
         start_idx=args.start_idx,
+        start_idx_per_stage=start_idx_map,
+        end_idx=args.end_idx,
+        end_idx_per_stage=end_idx_map,
         act_kind=args.act,
         tau=args.tau,
         beta=args.beta,
@@ -559,9 +653,28 @@ def run(
     replacements: List[Tuple[nn.Module, str, nn.Module]] = []
     n = 0
     per_act: Dict[str, PsyAct] = {}
+    stage_depths: Dict[str, int] = {"down": 0, "mid": 0, "up": 0}
     try:
-        n, per_act, replacements = patch_denoiser(denoiser, cfg)
-        print(f"[UNet] Patched {n} activation modules | act={args.act} tau={args.tau} beta={args.beta} gamma={args.gamma} | stages={cfg.stages} start_idx={cfg.start_idx} MLP={cfg.patch_attn_mlp} | denoiser={denoiser_attr}")
+        n, per_act, replacements, stage_depths = patch_denoiser(denoiser, cfg)
+        patched_modules = list(per_act.values())
+        print(f"[UNet] Patched {n} activation modules | act={args.act} tau={args.tau} beta={args.beta} gamma={args.gamma} | stages={cfg.stages} start_idx={args.start_idx} end_idx={args.end_idx} MLP={cfg.patch_attn_mlp} | denoiser={denoiser_attr}")
+
+        def set_modules_active(active: bool) -> None:
+            for module in patched_modules:
+                module.set_active(active)
+
+        set_modules_active(True)
+
+        total_steps = int(getattr(args, "steps", len(per_act))) if getattr(args, "steps", None) is not None else len(per_act)
+        step_start = max(0, int(getattr(args, "step_start", 0) or 0))
+        if getattr(args, "step_end", None) is None:
+            step_end = None
+        else:
+            step_end = max(step_start, int(args.step_end))
+            if total_steps > 0:
+                step_end = min(step_end, total_steps - 1)
+        args.step_start = step_start
+        args.step_end = step_end
 
         # ---- Variance-match (module path only) ----
         if args.calibrate and per_act:
@@ -576,7 +689,25 @@ def run(
                 call_kwargs = _build_pipe_call_kwargs(args, g)
                 imgB = pipe(**call_kwargs).images[0]
         else:
+            apply_full_span = step_start <= 0 and (step_end is None or (total_steps > 0 and step_end >= total_steps - 1))
+
+            callback = None
+            if not apply_full_span:
+                set_modules_active(step_start <= 0)
+
+                def _step_callback(step: int, timestep: int, latents):
+                    active = step >= step_start and (step_end is None or step <= step_end)
+                    set_modules_active(active)
+                    return latents
+
+                callback = _step_callback
+            else:
+                set_modules_active(True)
+
             call_kwargs = _build_pipe_call_kwargs(args, g)
+            if callback is not None:
+                call_kwargs["callback"] = callback
+                call_kwargs["callback_steps"] = 1
             imgB = pipe(**call_kwargs).images[0]
     finally:
         if replacements:
@@ -611,6 +742,10 @@ def run(
         "denoiser": denoiser_attr,
         "reuse_baseline": False if skip_baseline else not need_new_baseline,
         "skip_baseline": skip_baseline,
+        "stage_depths": stage_depths,
+        "start_idx_map": cfg.start_idx_per_stage,
+        "end_idx_map": cfg.end_idx_per_stage,
+        "step_window": {"start": args.step_start, "end": args.step_end},
     }
 
 def run_from_kwargs(
@@ -637,6 +772,15 @@ def run_from_kwargs(
         "gamma": 1.0,
         "stages": "up,mid",
         "start_idx": 0,
+        "end_idx": None,
+        "start_idx_down": None,
+        "start_idx_mid": None,
+        "start_idx_up": None,
+        "end_idx_down": None,
+        "end_idx_mid": None,
+        "end_idx_up": None,
+        "step_start": 0,
+        "step_end": None,
         "patch_mlp": False,
         "calibrate": False,
         "model_id": "runwayml/stable-diffusion-v1-5",
@@ -679,7 +823,7 @@ def main():
 
     # knobs
     p.add_argument("--act", type=str, default="silu",
-                   choices=["silu","gelu","gelu_tanh","relu","leakyrelu","mish","hswish","softsign","softplus"])
+                   choices=["silu","gelu","gelu_tanh","relu","leakyrelu","mish","hswish","softsign","softplus","hardtanh"])
     p.add_argument("--tau", type=float, default=1.0, help="Pre-activation temperature (>1 flattens curvature)")
     p.add_argument("--beta", type=float, default=0.0, help="Identity blend (0..1)")
     p.add_argument("--gamma", type=float, default=1.0, help="Blend toward new act before identity")
@@ -687,6 +831,15 @@ def main():
     # targeting
     p.add_argument("--stages", type=str, default="up,mid", help="Comma list from {down,mid,up}")
     p.add_argument("--start-idx", type=int, default=0, help="First resblock index within selected stages")
+    p.add_argument("--start-idx-down", type=int, default=None, help="Override start index for down stage (defaults to --start-idx)")
+    p.add_argument("--start-idx-mid", type=int, default=None, help="Override start index for mid stage (defaults to --start-idx)")
+    p.add_argument("--start-idx-up", type=int, default=None, help="Override start index for up stage (defaults to --start-idx)")
+    p.add_argument("--end-idx", type=int, default=None, help="Last resblock index (inclusive) within selected stages (default: no limit)")
+    p.add_argument("--end-idx-down", type=int, default=None, help="Override end index for down stage")
+    p.add_argument("--end-idx-mid", type=int, default=None, help="Override end index for mid stage")
+    p.add_argument("--end-idx-up", type=int, default=None, help="Override end index for up stage")
+    p.add_argument("--step-start", type=int, default=0, help="First denoising step (0-indexed) to apply patched activations")
+    p.add_argument("--step-end", type=int, default=None, help="Last denoising step (inclusive) to apply patched activations")
     p.add_argument("--patch-mlp", action="store_true", help="Also patch attention MLP activations")
 
     # calibration
