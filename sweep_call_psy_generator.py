@@ -22,7 +22,7 @@ Example:
     --calibrate \
     --patch-mlp
 """
-import argparse, csv, itertools, os, math, subprocess, sys, shlex, traceback
+import argparse, csv, itertools, os, math, subprocess, sys, shlex, traceback, json
 from typing import List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -133,7 +133,7 @@ def main():
     ap.add_argument("--acts", type=str, default="silu,mish,gelu_tanh")
     ap.add_argument("--taus", type=str, default="1.0,1.2,1.4")
     ap.add_argument("--betas", type=str, default="0.0,0.15,0.3")
-    ap.add_argument("--gamma", type=float, default=1.0)
+    ap.add_argument("--gammas", type=str, default="1.0", help="Single value or comma list for gamma blend")
     ap.add_argument("--stages", type=str, default="up,mid")
     ap.add_argument("--start-idx", type=int, default=0)
     ap.add_argument("--patch-mlp", action="store_true")
@@ -145,7 +145,23 @@ def main():
     ap.add_argument("--cols", type=int, default=3)
     ap.add_argument("--subprocess", action="store_true",
                     help="Force subprocess execution per run (disables pipeline reuse).")
+    ap.add_argument("--height", type=int, default=None, help="Optional image height override")
+    ap.add_argument("--width", type=int, default=None, help="Optional image width override")
+    ap.add_argument("--negative-prompt", type=str, default=None, help="Optional negative prompt shared across runs")
+    ap.add_argument("--model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    ap.add_argument("--pipeline", type=str, default="auto", choices=["auto","sd","sdxl","sd3"])
+    ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16","bf16","fp32"])
+    ap.add_argument("--denoiser", type=str, default=None, help="Optional override for the denoiser attribute (e.g., unet, transformer)")
+    ap.add_argument("--pipe-kwargs", type=str, default="{}", help="JSON dict forwarded to pipeline.from_pretrained")
+    ap.add_argument("--vae-tiling", action="store_true", help="Enable VAE tiling to reduce memory usage")
+    ap.add_argument("--vae-slicing", action="store_true", help="Enable VAE slicing to reduce memory usage")
+    ap.add_argument("--cpu-offload", action="store_true", help="Enable model CPU offload (requires accelerate)")
+    ap.add_argument("--disable-attention-slicing", action="store_true", help="Disable attention slicing on the pipeline")
     args = ap.parse_args()
+    try:
+        args.pipe_kwargs = json.loads(args.pipe_kwargs) if args.pipe_kwargs else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON for --pipe-kwargs: {exc}") from exc
 
     ensure_dir(args.outdir)
 
@@ -153,6 +169,7 @@ def main():
     taus  = [float(x) for x in args.taus.split(",")]
     betas = [float(x) for x in args.betas.split(",")]
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    gammas = [float(x) for x in args.gammas.split(",") if x.strip()]
 
     # Contact sheet items (start with a single baseline from the first combo)
     thumbs = []
@@ -161,30 +178,78 @@ def main():
               "lpips","mse","entropy","sharpness","patched_path","baseline_path","out_tag"]
     rows.append(header)
 
-    combolist = list(itertools.product(acts, taus, betas))
+    combolist = list(itertools.product(acts, taus, betas, gammas))
+    total_runs = len(combolist)
+    print(f"[SWEEP] Total configurations: {total_runs}")
 
     reuse = not args.subprocess
     pipe = None
     run_kwargs = None
+    baseline_cache = {}
+    baseline_key = None
+    baseline_path = os.path.join(args.outdir, "baseline.png")
+    baseline_saved = os.path.exists(baseline_path)
     if reuse:
         import sd_unet_psy_acts as psy
-        pipe = psy.load_pipeline()
+        pipe = psy.load_pipeline(
+            model_id=args.model_id,
+            pipeline_kind=args.pipeline,
+            dtype=psy.resolve_dtype(args.dtype),
+            device_override=psy.device,
+            attention_slicing=not args.disable_attention_slicing,
+            vae_tiling=args.vae_tiling,
+            vae_slicing=args.vae_slicing,
+            cpu_offload=args.cpu_offload,
+            **(args.pipe_kwargs or {}),
+        )
         run_kwargs = {
             "prompt": args.prompt,
             "steps": args.steps,
             "cfg": args.cfg,
             "seed": args.seed,
-            "gamma": args.gamma,
             "stages": ",".join(stages),
             "start_idx": args.start_idx,
             "patch_mlp": args.patch_mlp,
             "calibrate": args.calibrate,
+            "model_id": args.model_id,
+            "pipeline": args.pipeline,
+            "dtype": args.dtype,
+            "height": args.height,
+            "width": args.width,
+            "negative_prompt": args.negative_prompt,
+            "denoiser": args.denoiser,
+            "pipe_kwargs": args.pipe_kwargs,
+            "vae_tiling": args.vae_tiling,
+            "vae_slicing": args.vae_slicing,
+            "cpu_offload": args.cpu_offload,
+            "disable_attention_slicing": args.disable_attention_slicing,
         }
+        baseline_key = (
+            args.model_id,
+            args.pipeline,
+            args.dtype,
+            args.prompt,
+            args.steps,
+            args.cfg,
+            args.seed,
+            args.height,
+            args.width,
+            args.negative_prompt,
+            args.denoiser,
+            args.vae_tiling,
+            args.vae_slicing,
+            args.cpu_offload,
+            args.disable_attention_slicing,
+            json.dumps(args.pipe_kwargs, sort_keys=True),
+        )
 
     # Generate once per combo by calling the original generator
-    for idx, (act, tau, beta) in enumerate(combolist, start=1):
-        tag = f"act={act}_tau={tau}_beta={beta}_gamma={args.gamma}_stg={'-'.join(stages)}_idx={args.start_idx}{'_mlp' if args.patch_mlp else ''}"
+    pipe_kwargs_str = json.dumps(args.pipe_kwargs, sort_keys=True) if args.pipe_kwargs else "{}"
+
+    for idx, (act, tau, beta, gamma) in enumerate(combolist, start=1):
+        tag = f"act={act}_tau={tau}_beta={beta}_gamma={gamma}_stg={'-'.join(stages)}_idx={args.start_idx}{'_mlp' if args.patch_mlp else ''}"
         out_base = os.path.join(args.outdir, f"{tag}.png")
+        print(f"[SWEEP] ({idx}/{total_runs}) {tag}")
 
         gen_args = [
             "--prompt", args.prompt,
@@ -195,12 +260,33 @@ def main():
             "--act", act,
             "--tau", str(tau),
             "--beta", str(beta),
-            "--gamma", str(args.gamma),
+            "--gamma", str(gamma),
             "--stages", ",".join(stages),
             "--start-idx", str(args.start_idx)
         ]
-        if args.patch_mlp: gen_args.append("--patch-mlp")
-        if args.calibrate: gen_args.append("--calibrate")
+        if args.patch_mlp:
+            gen_args.append("--patch-mlp")
+        if args.calibrate:
+            gen_args.append("--calibrate")
+        if args.height is not None:
+            gen_args.extend(["--height", str(args.height)])
+        if args.width is not None:
+            gen_args.extend(["--width", str(args.width)])
+        if args.negative_prompt:
+            gen_args.extend(["--negative-prompt", args.negative_prompt])
+        gen_args.extend(["--model-id", args.model_id, "--pipeline", args.pipeline, "--dtype", args.dtype])
+        if args.denoiser:
+            gen_args.extend(["--denoiser", args.denoiser])
+        if args.pipe_kwargs:
+            gen_args.extend(["--pipe-kwargs", pipe_kwargs_str])
+        if args.vae_tiling:
+            gen_args.append("--vae-tiling")
+        if args.vae_slicing:
+            gen_args.append("--vae-slicing")
+        if args.cpu_offload:
+            gen_args.append("--cpu-offload")
+        if args.disable_attention_slicing:
+            gen_args.append("--disable-attention-slicing")
 
         if reuse:
             try:
@@ -211,22 +297,39 @@ def main():
                     "act": act,
                     "tau": tau,
                     "beta": beta,
+                    "gamma": gamma,
                 })
-                psy.run_from_kwargs(pipe=pipe, **per_run)
+                save_flag = not baseline_saved
+                run_info = psy.run_from_kwargs(
+                    pipe=pipe,
+                    baseline_cache=baseline_cache,
+                    baseline_key=baseline_key,
+                    baseline_path=baseline_path,
+                    save_baseline=save_flag,
+                    **per_run,
+                )
+                if save_flag:
+                    baseline_saved = True
                 rc = 0
             except Exception as exc:
                 print(f"[WARN] Generator exception for {tag}: {exc}")
                 traceback.print_exc()
                 rc = 1
+                run_info = None
         else:
             rc = run_generator(args.gen_path, gen_args)
+            run_info = None
 
         if rc != 0:
             print(f"[WARN] Generator returned {rc} for {tag}; skipping metrics.")
             continue
 
-        base_path   = out_base.replace(".png", "_A_baseline.png")
-        patch_path  = out_base.replace(".png", "_B_patched.png")
+        if reuse and run_info:
+            base_path = run_info["baseline_path"]
+            patch_path = run_info["patched_path"]
+        else:
+            base_path = out_base.replace(".png", "_A_baseline.png")
+            patch_path = out_base.replace(".png", "_B_patched.png")
         if not (os.path.exists(base_path) and os.path.exists(patch_path)):
             print(f"[WARN] Missing outputs for {tag}; expected {base_path} and {patch_path}")
             continue
@@ -244,10 +347,10 @@ def main():
         ent = entropy(patch_img)
         shp = sharpness_var_laplacian(patch_img)
 
-        cap = f"{act}\nτ={tau} β={beta}\nLPIPS={lp if not np.isnan(lp) else float('nan'):.3f}"
+        cap = f"{act}\nτ={tau} β={beta} γ={gamma}\nLPIPS={lp if not np.isnan(lp) else float('nan'):.3f}"
         thumbs.append((patch_img, cap))
 
-        rows.append([act, tau, beta, args.gamma, "-".join(stages), args.start_idx, int(args.patch_mlp),
+        rows.append([act, tau, beta, gamma, "-".join(stages), args.start_idx, int(args.patch_mlp),
                      lp, m, ent, shp, patch_path, base_path, tag])
 
     # Save CSV
