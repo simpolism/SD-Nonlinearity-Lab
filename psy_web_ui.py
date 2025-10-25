@@ -1,7 +1,7 @@
 """
 Local Flask web UI for sd_unet_psy_acts.
 
-Provides a simple 90s-psychedelic themed control panel to tweak activation knobs
+Provides a simple control panel to tweak activation knobs
 and preview baseline vs patched outputs without running a full sweep.
 """
 
@@ -421,7 +421,7 @@ TEMPLATE = r"""
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <title>Psy UNet Lab</title>
+    <title>SD Nonlinearity Lab</title>
     <style>
         body {
             font-family: "IBM Plex Sans", "Courier New", monospace;
@@ -783,8 +783,8 @@ TEMPLATE = r"""
 </head>
 <body>
     <header>
-        <h1>Psy UNet Control Pad</h1>
-        <p>Device: {{ device.upper() }} &nbsp;|&nbsp; Quick knob sandbox for sd_unet_psy_acts</p>
+        <h1>SD Nonlinearity Lab</h1>
+        <p>Device: {{ device.upper() }} &nbsp;|&nbsp; Explore nonlinearity substitution in Stable Diffusion</p>
     </header>
     <main>
         <section class="panel">
@@ -880,7 +880,7 @@ TEMPLATE = r"""
 
                 <div id="loading-indicator" class="loading-status" aria-live="polite" aria-busy="false">
                     <div class="spinner"></div>
-                    <span>Rendering psychedelic layers...</span>
+                    <span>Rendering with patched activations...</span>
                 </div>
 
                 {% if message %}
@@ -1419,5 +1419,5 @@ TEMPLATE = r"""
 # ---------------------- Entrypoint ----------------------
 
 if __name__ == "__main__":
-    print("Launching Psy UNet Control Pad at http://127.0.0.1:7860")
+    print("Launching SD Nonlinearity Lab at http://127.0.0.1:7860")
     APP.run(host="127.0.0.1", port=7860, debug=False)

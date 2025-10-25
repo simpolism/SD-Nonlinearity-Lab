@@ -1,8 +1,8 @@
-# SD Psychedelic Lab
+# SD Nonlinearity Lab
 
-SD Psychedelic Lab is an inference-time playground for Stable Diffusion activation experiments.  It lets you flatten or remix UNet nonlinearities, gate those interventions by stage and denoising step, and compare patched vs. baseline renders side by side.  Nothing is fine-tuned—everything happens on-the-fly with deterministic seeds.
+SD Nonlinearity Lab is an inference-time playground for Stable Diffusion activation experiments.  It lets you substitute, flatten, or remix UNet nonlinearities, gate those interventions by stage and denoising step, and compare patched vs. baseline renders side by side.  Nothing is fine-tuned—everything happens on-the-fly with deterministic seeds.
 
-Biologically, classic psychedelics (e.g., LSD, psilocybin) are associated with relaxed gating and increased entropy in cortical circuits—there is evidence that dendritic nonlinearities flatten and functional connectivity becomes more fluid.  That softened “transfer curve” allows atypical signals to propagate, producing novel associations and vivid perceptual blends.  Stable Diffusion employs SiLU activations throughout its UNet; by nudging those nonlinearities toward flatter or identity-like responses we can mimic a similar loosening.  SD Psychedelic Lab provides safe, reversible knobs for probing how activation geometry shapes coherence, texture, and semantics inside a generative model.
+Stable Diffusion employs SiLU activations throughout its UNet; by substituting alternative nonlinearities (GELU, Mish, ReLU, etc.) or adjusting their curvature, we can explore how activation geometry shapes coherence, texture, and semantics inside a generative model. SD Nonlinearity Lab provides safe, reversible knobs for probing the role of different nonlinear functions in the diffusion process, enabling systematic experimentation with activation functions to understand their impact on image generation.
 
 ---
 
@@ -112,4 +112,4 @@ python sweep_call_psy_generator.py \
 - Optional automatic parameter sweeps with contact sheet output.
 - Extended analytics (LPIPS/CLIP score) for batch comparisons.
 
-Pull requests and experiments welcome—open an issue to discuss new activation schedules or visualization ideas.  Have fun bending diffusion activations into psychedelic territory! 🌈
+Pull requests and experiments welcome—open an issue to discuss new activation schedules or visualization ideas.  Have fun exploring how nonlinearities shape diffusion outputs!

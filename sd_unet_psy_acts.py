@@ -193,7 +193,7 @@ def make_base_act(kind: str) -> nn.Module:
 
 class PsyAct(nn.Module):
     """
-    Psychedelic-style activation wrapper with 3 knobs + optional affine correction:
+    Flexible activation wrapper with 3 knobs + optional affine correction:
       mix = (1-gamma)*SiLU(x/tau) + gamma*new_act(x/tau)
       y   = (1-beta)*mix + beta*x
       out = gain*y + bias

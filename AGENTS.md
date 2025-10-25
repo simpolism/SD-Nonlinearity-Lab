@@ -1,4 +1,4 @@
-# SD Psychedelic Lab – Agent Guide
+# SD Nonlinearity Lab – Agent Guide
 
 This document is aimed at any automated assistant or scripted workflow that operates inside this repository.  Use it to understand the preferred entry points, constraints, and coordination rules.
 
@@ -6,7 +6,7 @@ This document is aimed at any automated assistant or scripted workflow that oper
 
 ## 1. Mission Snapshot
 
-SD Psychedelic Lab is an experimentation harness for altering Stable Diffusion UNet activations at inference time.  Two surfaces matter:
+SD Nonlinearity Lab is an experimentation harness for exploring different nonlinearities in Stable Diffusion UNet activations at inference time.  Two surfaces matter:
 
 1. `sd_unet_psy_acts.py` – CLI/SDK for patching activations, caching baselines, and variance-matching.
 2. `psy_web_ui.py` – Flask web application that wraps the CLI in a controls dashboard (per-stage start/end, step windows, baseline previews).
@@ -104,4 +104,4 @@ Environment tips:
 
 ---
 
-Stay within these guidelines and SD Psychedelic Lab should remain stable, reproducible, and ready for psychedelic activation explorations. Happy hallucinating! 👾🌈
+Stay within these guidelines and SD Nonlinearity Lab should remain stable, reproducible, and ready for activation explorations.
