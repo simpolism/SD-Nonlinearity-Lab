@@ -21,11 +21,11 @@ Stable Diffusion employs SiLU activations throughout its UNet; by substituting a
 
 Below are examples showing how different activation function settings transform the same prompt ("dreamlike reading nook"):
 
-| Stylized (Modified Activations) | Photorealistic (Baseline/Different Settings) |
-|:-------------------------------:|:---------------------------------------------:|
+| SiLU (τ=1, β=0.15, γ=0.3) | HSwish (τ=1.1, γ=0.5) |
+|:-------------------------:|:---------------------:|
 | ![nl1](images/nl1.jpeg) | ![nl2](images/nl2.jpeg) |
 
-Different choices of nonlinearity, curvature flattening, and stage targeting produce dramatically different artistic styles—from high-contrast, sketch-like outputs to soft, photorealistic renders.
+Different choices of nonlinearity, curvature flattening (`tau`), identity blending (`beta`, `gamma`), and step targeting produce dramatically different artistic styles—from high-contrast, sketch-like outputs to soft, photorealistic renders.
 
 ---
 
