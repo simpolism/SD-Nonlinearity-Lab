@@ -17,6 +17,18 @@ Stable Diffusion employs SiLU activations throughout its UNet; by substituting a
 
 ---
 
+## Demonstrations
+
+Below are examples showing how different activation function settings transform the same prompt ("dreamlike reading nook"):
+
+| Stylized (Modified Activations) | Photorealistic (Baseline/Different Settings) |
+|:-------------------------------:|:---------------------------------------------:|
+| ![nl1](images/nl1.jpeg) | ![nl2](images/nl2.jpeg) |
+
+Different choices of nonlinearity, curvature flattening, and stage targeting produce dramatically different artistic styles—from high-contrast, sketch-like outputs to soft, photorealistic renders.
+
+---
+
 ## Installation
 
 ```bash
